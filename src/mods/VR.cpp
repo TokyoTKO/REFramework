@@ -3324,9 +3324,22 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         const auto name = utility::re_game_object::get_name(game_object);
         const auto name_hash = utility::hash(name);
 
+        // Log each stage once per hacking panel on this render thread.
+        const auto log_pragmata_gate = [&](const char* stage) {
 #if defined(PRAGMATA)
-        // Diagnostic: View names exposed to Lua differ from the GameObject names
-        // used by this native UI path. Log each native name once.
+            if (name_hash == "ui3400Gui"_fnv || name_hash == "ui3500Gui"_fnv ||
+                name_hash == "ui3510Gui"_fnv) {
+                static thread_local std::unordered_map<size_t, std::unordered_set<std::string>> stages;
+                if (stages[name_hash].insert(stage).second) {
+                    spdlog::info("[PragmataVRUIGate] name='{}' stage={}", name, stage);
+                }
+            }
+#endif
+        };
+        log_pragmata_gate("native-entry");
+
+#if defined(PRAGMATA)
+        // Diagnostic: log native GameObject names once.
         static std::unordered_set<size_t> pragmata_logged_gui_names{};
         if (!pragmata_logged_gui_names.contains(name_hash)) {
             pragmata_logged_gui_names.insert(name_hash);
@@ -3419,9 +3432,13 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 
         auto view = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
 
+        if (view == nullptr) { log_pragmata_gate("skip-null-view"); }
         if (view != nullptr) {
             const auto current_view_type = sdk::call_object_func<uint32_t>(view, "get_ViewType", context, view);
 
+            log_pragmata_gate(current_view_type == (uint32_t)via::gui::ViewType::Screen
+                ? "incoming-screen" : (current_view_type == (uint32_t)via::gui::ViewType::World
+                    ? "skip-incoming-world" : "skip-other-view-type"));
             if (current_view_type == (uint32_t)via::gui::ViewType::Screen) {
                 static sdk::RETypeDefinition* via_render_mesh_typedef = nullptr;
 
@@ -3430,6 +3447,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 
                     // wait
                     if (via_render_mesh_typedef == nullptr) {
+                        log_pragmata_gate("skip-mesh-type-unavailable");
                         return true;
                     }
                 }
@@ -3438,6 +3456,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 // because it might be something physical in the game world
                 // that the player can interact with
                 if (utility::re_component::find(game_object->transform, via_render_mesh_typedef->get_type()) != nullptr) {
+                    log_pragmata_gate("skip-mesh-component");
                     return true;
                 }
 
@@ -3480,11 +3499,14 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 }*/
 
                 auto camera = sdk::get_primary_camera();
+                log_pragmata_gate(camera == nullptr ? "skip-null-camera" : "camera-present");
 
                 // Set the gui element's position to be in front of the camera
                 if (camera != nullptr) {
                     auto camera_object = utility::re_component::get_game_object(camera);
 
+                    log_pragmata_gate(camera_object == nullptr || camera_object->transform == nullptr
+                        ? "skip-camera-object-or-transform" : "camera-transform-present");
                     if (camera_object != nullptr && camera_object->transform != nullptr) {
                         auto& gui_matrix = game_object->transform->worldTransform;
                         auto child = sdk::call_object_func<REManagedObject*>(view, "get_Child", context, view);
@@ -3640,6 +3662,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                             break;
                         default:
                             if (!seenGuiNames.contains(name_hash)) {
+                                log_pragmata_gate("skip-first-encounter");
                                 seenGuiNames[name_hash] = 1;
                                 return true;
                             }
@@ -3691,6 +3714,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                             wanted_rotation = gui_rotation_offset * wanted_rotation;
                         }
 
+                        log_pragmata_gate("reached-camera-correction");
                         const auto wanted_rotation_mat = Matrix4x4f{wanted_rotation};
 
 #if defined(RE9)
