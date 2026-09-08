@@ -298,10 +298,24 @@ void VR::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* re
     }
 }
 
+#if defined(PRAGMATA)
+// Diagnostic correlation only; zero means outside a tracked panel's draw callback.
+static thread_local int g_pragmata_diagnostic_panel = 0;
+#endif
+
 Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, Matrix4x4f* result) {
     auto original_func = g_projection_matrix_hook2->get_original<decltype(VR::gui_camera_get_projection_matrix_hook)>();
 
     auto& vr = VR::get();
+
+#if defined(PRAGMATA)
+    static thread_local std::unordered_map<int, uint32_t> projection_samples;
+    auto& sample = projection_samples[g_pragmata_diagnostic_panel];
+    if (sample < 4) {
+        spdlog::info("[PragmataGUICamera] callback panel={} sample={} disabled={} camera=0x{:x}",
+            g_pragmata_diagnostic_panel, sample++, vr->m_disable_gui_camera_projection_matrix_override, (uintptr_t)camera);
+    }
+#endif
 
     if (result == nullptr || !g_framework->is_ready() || !vr->is_hmd_active() || vr->m_disable_gui_camera_projection_matrix_override) {
         return original_func(camera, result);
@@ -1784,8 +1798,27 @@ std::optional<std::string> VR::hijack_camera() {
         // Pattern scan for the native function call
         auto ref = utility::scan((uintptr_t)func, 0x100, "49 8B C8 E8");
 
+#if defined(PRAGMATA)
+        spdlog::info("[PragmataGUICamera] pattern_found={} primary_method=0x{:x} wrapper=0x{:x}",
+            ref.has_value(), get_projection_matrix, (uintptr_t)func);
+        if (!ref) {
+            // Same 256-byte region already inspected by the existing scanner.
+            std::string bytes;
+            const auto code = reinterpret_cast<const uint8_t*>(func);
+            for (size_t i = 0; i < 0x100; ++i) {
+                bytes += fmt::format("{:02x}", code[i]);
+            }
+            spdlog::info("[PragmataGUICamera] wrapper_bytes={}", bytes);
+        }
+#endif
+
         if (ref) {
             auto native_func = utility::calculate_absolute(*ref + 4);
+
+#if defined(PRAGMATA)
+            spdlog::info("[PragmataGUICamera] native_target=0x{:x} shared_with_primary={}",
+                native_func, native_func == get_projection_matrix);
+#endif
 
             if (native_func != get_projection_matrix) {
                 // Hook the native function
@@ -1793,6 +1826,10 @@ std::optional<std::string> VR::hijack_camera() {
 
                 if (g_projection_matrix_hook2->create()) {
                     spdlog::info("Hooked via.gui.GUICamera.get_ProjectionMatrix");
+                } else {
+#if defined(PRAGMATA)
+                    spdlog::error("[PragmataGUICamera] hook_creation_failed");
+#endif
                 }
             } else {
                 spdlog::info("Did not hook via.gui.GUICamera.get_ProjectionMatrix, same as via.Camera.get_ProjectionMatrix");
@@ -3326,6 +3363,10 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         const auto name_hash = utility::hash(name);
 
         // Log each stage once per hacking panel on this render thread.
+#if defined(PRAGMATA)
+        g_pragmata_diagnostic_panel = name_hash == "ui3400Gui"_fnv ? 3400 :
+            (name_hash == "ui3510Gui"_fnv ? 3510 : 0);
+#endif
         const auto log_pragmata_gate = [&](const char* stage) {
 #if defined(PRAGMATA)
             if (name_hash == "ui3400Gui"_fnv || name_hash == "ui3500Gui"_fnv ||
@@ -3928,6 +3969,9 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 }
 
 void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) {
+#if defined(PRAGMATA)
+    g_pragmata_diagnostic_panel = 0;
+#endif
     
 
     //spdlog::info("VR: on_gui_draw_element");
