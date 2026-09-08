@@ -3708,7 +3708,27 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         if (name_hash == "ui3400Gui"_fnv ||
                             name_hash == "ui3500Gui"_fnv ||
                             name_hash == "ui3510Gui"_fnv) {
-                            const auto eye_camera_matrix = m_original_camera_matrix * get_current_eye_transform(true);
+                            const auto eye_transform = get_current_eye_transform(true);
+                            const auto eye_camera_matrix = m_original_camera_matrix * eye_transform;
+
+                            static std::unordered_map<size_t, uint32_t> pragmata_eye_log_counts{};
+                            auto& eye_log_count = pragmata_eye_log_counts[name_hash];
+                            if (eye_log_count < 16) {
+                                const auto original_pos = m_original_camera_matrix[3];
+                                const auto eye_pos = eye_transform[3];
+                                const auto combined_pos = eye_camera_matrix[3];
+                                const auto render_pos = m_render_camera_matrix[3];
+                                spdlog::info(
+                                    "[PragmataVRUIEye] name='{}' sample={} original=({:.6f},{:.6f},{:.6f}) eye=({:.6f},{:.6f},{:.6f}) combined=({:.6f},{:.6f},{:.6f}) render=({:.6f},{:.6f},{:.6f})",
+                                    name, eye_log_count,
+                                    original_pos.x, original_pos.y, original_pos.z,
+                                    eye_pos.x, eye_pos.y, eye_pos.z,
+                                    combined_pos.x, combined_pos.y, combined_pos.z,
+                                    render_pos.x, render_pos.y, render_pos.z
+                                );
+                                ++eye_log_count;
+                            }
+
                             camera_position = eye_camera_matrix[3];
                         }
 #endif
