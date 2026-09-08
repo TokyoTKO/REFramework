@@ -3303,6 +3303,7 @@ struct GUIRestoreData {
     via::gui::ViewType view_type{ via::gui::ViewType::Screen };
     bool overlay{false};
     bool detonemap{true};
+    std::optional<Matrix4x4f> original_world_transform{};
 };
 
 thread_local std::vector<std::unique_ptr<GUIRestoreData>> g_elements_to_reset{};
@@ -3438,8 +3439,18 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 
             log_pragmata_gate(current_view_type == (uint32_t)via::gui::ViewType::Screen
                 ? "incoming-screen" : (current_view_type == (uint32_t)via::gui::ViewType::World
-                    ? "skip-incoming-world" : "skip-other-view-type"));
-            if (current_view_type == (uint32_t)via::gui::ViewType::Screen) {
+                    ? "incoming-world" : "skip-other-view-type"));
+            bool pragmata_hacking_world_view = false;
+#if defined(PRAGMATA)
+            pragmata_hacking_world_view =
+                current_view_type == (uint32_t)via::gui::ViewType::World &&
+                (name_hash == "ui3400Gui"_fnv || name_hash == "ui3510Gui"_fnv);
+#endif
+            if (pragmata_hacking_world_view) {
+                log_pragmata_gate("route-world-hacking-to-vr-placement");
+            }
+            if (current_view_type == (uint32_t)via::gui::ViewType::Screen ||
+                pragmata_hacking_world_view) {
                 static sdk::RETypeDefinition* via_render_mesh_typedef = nullptr;
 
                 if (via_render_mesh_typedef == nullptr) {
@@ -3470,6 +3481,9 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 auto& restore_data = g_elements_to_reset.emplace_back(std::make_unique<GUIRestoreData>());
                 auto original_game_object_pos = sdk::get_transform_position(game_object->transform);
 
+                if (pragmata_hacking_world_view) {
+                    restore_data->original_world_transform = game_object->transform->worldTransform;
+                }
                 restore_data->element = gui_element;
                 restore_data->view = view;
                 restore_data->original_position = original_game_object_pos;
@@ -3760,6 +3774,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         gui_matrix = wanted_rotation_mat;
                         gui_matrix[3] = camera_position + (wanted_rotation_mat[2] * ui_distance) + (wanted_rotation_mat[0] * right_world_adjust);
                         gui_matrix[3].w = 1.0f;
+                        log_pragmata_gate("placement-matrix-written");
 
                         // Scales the GUI so it's not massive.
                         if (!wants_face_glue) {
@@ -3921,7 +3936,7 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
 
     // Restore elements back to original states
     for (auto& data : g_elements_to_reset) {
-        sdk::call_object_func<void*>(data->view, "set_ViewType", context, data->view, (uint32_t)via::gui::ViewType::Screen);
+        sdk::call_object_func<void*>(data->view, "set_ViewType", context, data->view, (uint32_t)data->view_type);
         sdk::call_object_func<void*>(data->view, "set_Overlay", context, data->view, data->overlay);
         sdk::call_object_func<void*>(data->view, "set_Detonemap", context, data->view, data->detonemap);
         
@@ -3931,7 +3946,11 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
             //sdk::set_transform_position(game_object->transform, data->original_position);
 
             auto& gui_matrix = game_object->transform->worldTransform;
-            gui_matrix[3] = data->original_position;
+            if (data->original_world_transform) {
+                gui_matrix = *data->original_world_transform;
+            } else {
+                gui_matrix[3] = data->original_position;
+            }
         }
     }
 
