@@ -90,6 +90,14 @@ std::optional<std::string> FaultyFileDetector::on_initialize() {
 }
 
 void FaultyFileDetector::initialize_impl() {
+#if defined(PRAGMATA)
+    // The tagged Pragmata source build crashes during this early scanner on the
+    // current game executable. This diagnostic subsystem is not required for VR.
+    m_initialized = true;
+    spdlog::info("[FaultyFileDetector]: Disabled for Pragmata experimental VR build");
+    return;
+#endif
+
     if (m_initialized) {
         return;
     }
