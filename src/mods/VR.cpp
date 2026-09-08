@@ -3324,6 +3324,16 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         const auto name = utility::re_game_object::get_name(game_object);
         const auto name_hash = utility::hash(name);
 
+#if defined(PRAGMATA)
+        // Diagnostic: View names exposed to Lua differ from the GameObject names
+        // used by this native UI path. Log each native name once.
+        static std::unordered_set<size_t> pragmata_logged_gui_names{};
+        if (!pragmata_logged_gui_names.contains(name_hash)) {
+            pragmata_logged_gui_names.insert(name_hash);
+            spdlog::info("[PragmataVRUI] GameObject name='{}' hash=0x{:X}", name, name_hash);
+        }
+#endif
+
         switch (name_hash) {
         // Don't mess with this, causes weird black boxes on the sides of the screen
         case "GUI_PillarBox"_fnv:
