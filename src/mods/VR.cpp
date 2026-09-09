@@ -3502,7 +3502,10 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 (name_hash == "ui3400Gui"_fnv || name_hash == "ui3510Gui"_fnv);
 #endif
             if (pragmata_hacking_world_view) {
-                log_pragmata_gate("route-world-hacking-to-vr-placement");
+                // Test the repaired GUI projection hook with the game's original
+                // World-mode hacking-panel transforms, without VR HUD placement.
+                log_pragmata_gate("preserve-original-world-hacking-placement");
+                return true;
             }
             if (current_view_type == (uint32_t)via::gui::ViewType::Screen ||
                 pragmata_hacking_world_view) {
