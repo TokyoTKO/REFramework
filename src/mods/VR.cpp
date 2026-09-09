@@ -1797,6 +1797,7 @@ std::optional<std::string> VR::hijack_camera() {
         
         // Pattern scan for the native function call
         auto ref = utility::scan((uintptr_t)func, 0x100, "49 8B C8 E8");
+        size_t call_displacement_offset = 4;
 
 #if defined(PRAGMATA)
         spdlog::info("[PragmataGUICamera] pattern_found={} primary_method=0x{:x} wrapper=0x{:x}",
@@ -1809,11 +1810,24 @@ std::optional<std::string> VR::hijack_camera() {
                 bytes += fmt::format("{:02x}", code[i]);
             }
             spdlog::info("[PragmataGUICamera] wrapper_bytes={}", bytes);
+
+            // Captured Pragmata wrapper: save output pointer, move camera from
+            // R8 to RCX, move output to RDX, then call the native implementation.
+            // Match the complete wrapper at its entry; never select a nearby function.
+            const auto fallback = utility::scan((uintptr_t)func, 0x20,
+                "56 48 83 EC 20 48 89 CE 4C 89 C1 48 89 F2 E8 ? ? ? ? 48 89 F0 48 83 C4 20 5E C3");
+            if (fallback && *fallback == (uintptr_t)func) {
+                ref = fallback;
+                call_displacement_offset = 15;
+                spdlog::info("[PragmataGUICamera] fallback_wrapper_matched=true");
+            } else {
+                spdlog::warn("[PragmataGUICamera] fallback_wrapper_matched=false; leaving GUI projection unhooked");
+            }
         }
 #endif
 
         if (ref) {
-            auto native_func = utility::calculate_absolute(*ref + 4);
+            auto native_func = utility::calculate_absolute(*ref + call_displacement_offset);
 
 #if defined(PRAGMATA)
             spdlog::info("[PragmataGUICamera] native_target=0x{:x} shared_with_primary={}",
