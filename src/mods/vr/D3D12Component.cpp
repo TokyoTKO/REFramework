@@ -70,12 +70,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (ui_probe_key_now && !ui_probe_key_down) {
         ui_probe_active = !ui_probe_active;
         ui_probe_started = GetTickCount64();
-        spdlog::info("[PragmataAFWUIProbeV1] preview={} (F8; automatic return after 20s)", ui_probe_active);
+        spdlog::info("[PragmataAFWHudlessProbeV2] testRequested={} (F8; automatic return after 20s)", ui_probe_active);
     }
     ui_probe_key_down = ui_probe_key_now;
     if (ui_probe_active && GetTickCount64() - ui_probe_started >= 20000) {
         ui_probe_active = false;
-        spdlog::info("[PragmataAFWUIProbeV1] preview=false (timeout)");
+        spdlog::info("[PragmataAFWHudlessProbeV2] testRequested=false (timeout)");
     }
 #endif
 
@@ -201,27 +201,30 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 const auto ui = params.InUIColorAlpha;
                 const auto texture = ui ? ui->pTexture : nullptr;
                 const auto desc = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
-                spdlog::info("[PragmataAFWUIProbeV1] eye={} uiFix={} supplied={} texture={} size={}x{} format={} isHudless={} mode={}",
+                spdlog::info("[PragmataAFWHudlessProbeV2] eye={} uiFix={} supplied={} texture={} size={}x{} format={} isHudless={} mode={}",
                     static_cast<int>(nEye), vr->m_enable_ui_fix->value(), ui != nullptr,
                     static_cast<void*>(texture), desc.Width, desc.Height, static_cast<int>(desc.Format),
                     params.IsHudlessColor, static_cast<int>(params.Mode));
                 ++ui_probe_samples;
             }
 #endif
-            EvaluateFrameWarp(params);
 #if defined(PRAGMATA)
-            if (ui_probe_active) {
-                // Preview the exact UI input before the existing clear below.
-                // The same texture is copied to both eye outputs.
-                if (params.InUIColorAlpha && params.InUIColorAlpha->pTexture) {
-                    vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.color, *params.InUIColorAlpha);
-                    vr->d3d12Renderer->Blit(cmdList, otherEyeFrameBuffer.color, *params.InUIColorAlpha);
-                } else {
-                    ui_probe_active = false;
-                    spdlog::warn("[PragmataAFWUIProbeV1] no UI texture supplied to AFW; normal image retained");
-                }
+            // Isolate only the plugin's scene-contains-UI assumption.
+            // UI input, descriptor setup, clearing and output buffers remain unchanged.
+            if (ui_probe_active && params.InUIColorAlpha && params.InUIColorAlpha->pTexture) {
+                params.IsHudlessColor = true;
+            }
+            static int ui_probe_last_state = -1;
+            const int ui_probe_state = ui_probe_active ? (params.InUIColorAlpha ? 1 : 2) : 0;
+            if (ui_probe_state != ui_probe_last_state) {
+                spdlog::info("[PragmataAFWHudlessProbeV2] effectiveTest={} uiSupplied={} isHudless={} mode={}",
+                    ui_probe_state == 1, params.InUIColorAlpha != nullptr,
+                    params.IsHudlessColor, static_cast<int>(params.Mode));
+                ui_probe_last_state = ui_probe_state;
             }
 #endif
+            EvaluateFrameWarp(params);
+
         } else if (vr->is_using_afw_foveated()) {
             auto foveatedVP = vr->get_runtime()->foveated_viewports[nEye];
             D3D12_VIEWPORT vp;
