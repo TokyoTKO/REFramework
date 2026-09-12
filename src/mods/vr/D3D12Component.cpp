@@ -1,4 +1,5 @@
 #include <openvr.h>
+#include <chrono>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,38 @@
 
 namespace vrmod {
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
+#if defined(PRAGMATA)
+    // Observation only: no GPU readback, waits, rendering changes or hotkeys.
+    using StartupClock = std::chrono::steady_clock;
+    static const auto startup_begin = StartupClock::now();
+    static auto startup_previous = startup_begin;
+    static auto startup_window = startup_begin;
+    static double startup_sum_ms = 0.0;
+    static double startup_max_ms = 0.0;
+    static unsigned int startup_samples = 0;
+    const auto startup_now = StartupClock::now();
+    const double startup_elapsed = std::chrono::duration<double>(startup_now - startup_begin).count();
+    const double startup_dt = std::chrono::duration<double, std::milli>(startup_now - startup_previous).count();
+    startup_previous = startup_now;
+    const bool startup_active = startup_elapsed < 120.0;
+    bool startup_report = false;
+    if (startup_active) {
+        startup_sum_ms += startup_dt;
+        if (startup_dt > startup_max_ms) startup_max_ms = startup_dt;
+        ++startup_samples;
+        if (std::chrono::duration<double>(startup_now - startup_window).count() >= 0.25) {
+            startup_report = true;
+            spdlog::info("[PragmataStartupV5] t={:.3f} samples={} submitMeanMs={:.3f} submitMaxMs={:.3f} frame={} afw={} uiFix={} foveated={} depth={} reset={}",
+                startup_elapsed, startup_samples, startup_sum_ms / startup_samples, startup_max_ms,
+                vr->m_render_frame_count, vr->is_using_any_afw(), vr->m_enable_ui_fix->value(),
+                vr->is_foveated_rendering(), vr->depthTex[0] != nullptr, m_force_reset);
+            startup_samples = 0;
+            startup_sum_ms = startup_max_ms = 0.0;
+            startup_window = startup_now;
+        }
+    }
+#endif
+
     if (m_openvr.left_eye_tex[0].texture == nullptr || m_force_reset) {
         setup();
     }
@@ -254,6 +287,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 vr->d3d12Renderer->Sharpen(cmdList, eyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color, vr->get_sharpness());
                 s_CurrentEyeFrameBuffer.color = eyeFrameBuffer.color;
             }
+
+#if defined(PRAGMATA)
+            // Emit on state transitions as well as the periodic timing sample.
+            static unsigned int startup_last_state = ~0u;
+            const unsigned int startup_state = (unsigned int)params.Mode |
+                ((unsigned int)params.MotionVectorsType << 4) |
+                ((params.InUIColorAlpha != nullptr ? 1u : 0u) << 8) |
+                ((params.IsHudlessColor ? 1u : 0u) << 9) |
+                ((params.ClearBeforeWarping ? 1u : 0u) << 10);
+            if (startup_active && (startup_report || startup_state != startup_last_state)) {
+                spdlog::info("[PragmataStartupV5] t={:.3f} evaluate eye={} mode={} mvType={} ui={} hudless={} clear={} width={} height={} dlssFix={}",
+                    startup_elapsed, (int)nEye, (int)params.Mode, (int)params.MotionVectorsType,
+                    params.InUIColorAlpha != nullptr, params.IsHudlessColor, params.ClearBeforeWarping,
+                    colorDesc.Width, colorDesc.Height, vr->is_fix_dlss());
+                startup_last_state = startup_state;
+            }
+#endif
             EvaluateFrameWarp(params);
 
         } else if (vr->is_using_afw_foveated()) {
@@ -349,6 +399,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             vpOther.Width = foveatedVPOther.Width * colorDesc.Width;
             vpOther.Height = foveatedVPOther.Height * colorDesc.Height;
             params.foveatedArea = RECT(vpOther.TopLeftX, vpOther.TopLeftY, vpOther.TopLeftX + vpOther.Width, vpOther.TopLeftY + vpOther.Height);
+
+#if defined(PRAGMATA)
+            // Emit on state transitions as well as the periodic timing sample.
+            static unsigned int startup_last_state = ~0u;
+            const unsigned int startup_state = (unsigned int)params.Mode |
+                ((unsigned int)params.MotionVectorsType << 4) |
+                ((params.InUIColorAlpha != nullptr ? 1u : 0u) << 8) |
+                ((params.IsHudlessColor ? 1u : 0u) << 9) |
+                ((params.ClearBeforeWarping ? 1u : 0u) << 10);
+            if (startup_active && (startup_report || startup_state != startup_last_state)) {
+                spdlog::info("[PragmataStartupV5] t={:.3f} evaluate eye={} mode={} mvType={} ui={} hudless={} clear={} width={} height={} dlssFix={}",
+                    startup_elapsed, (int)nEye, (int)params.Mode, (int)params.MotionVectorsType,
+                    params.InUIColorAlpha != nullptr, params.IsHudlessColor, params.ClearBeforeWarping,
+                    colorDesc.Width, colorDesc.Height, vr->is_fix_dlss());
+                startup_last_state = startup_state;
+            }
+#endif
             EvaluateFrameWarp(params);
         }
 
