@@ -74,12 +74,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (capture_key_now && !capture_key_down && capture_pending == 0) {
         capture_requested = GetTickCount64();
         capture_pending = 3;
-        spdlog::info("[PragmataAFWCaptureV3] armed; capture in 3 seconds; no AFW parameters changed");
+        spdlog::info("[PragmataAFWCaptureV4] armed; capture in 3 seconds; no AFW parameters changed");
     }
     capture_key_down = capture_key_now;
     if (capture_pending && GetTickCount64() - capture_requested > 15000) {
         capture_pending = 0;
-        spdlog::warn("[PragmataAFWCaptureV3] capture expired before both eyes were saved");
+        spdlog::warn("[PragmataAFWCaptureV4] capture expired before both eyes were saved");
     }
 #endif
 
@@ -158,51 +158,62 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     }
 
 #if defined(PRAGMATA)
-    // Save unsharpened scene and UI inputs BEFORE recording AFW work or clearing UI.
-    // Each texture returns to its declared state. Never overwrite eye/history textures.
+    bool capture_this_frame = false;
+    ComPtr<ID3D12Resource> capture_scene;
+    ComPtr<ID3D12Resource> capture_ui;
     const unsigned int capture_bit = 1u << static_cast<unsigned int>(nEye);
     if ((capture_pending & capture_bit) && GetTickCount64() - capture_requested >= 3000 &&
-        vr->is_using_any_afw() && !vr->is_foveated_rendering() && vr->depthTex[0]) {
+        vr->is_using_any_afw() && !vr->is_foveated_rendering() && vr->depthTex[0] &&
+        vr->uiBufferDesc[0].pTexture) {
         capture_pending &= ~capture_bit;
         try {
             if (capture_pending == (3u & ~capture_bit)) {
                 wchar_t exe_path[32768]{};
-                const auto path_length = GetModuleFileNameW(nullptr, exe_path, 32768);
-                if (!path_length || path_length >= 32768) {
-                    throw std::runtime_error("Cannot resolve game executable directory");
-                }
+                const auto length = GetModuleFileNameW(nullptr, exe_path, 32768);
+                if (!length || length >= 32768) throw std::runtime_error("Cannot resolve game directory");
                 capture_folder = std::filesystem::path(exe_path).parent_path() /
-                    L"reframework" / L"data" / (L"afw_capture_" + std::to_wstring(capture_requested));
+                    L"reframework" / L"data" / (L"afw_output_capture_" + std::to_wstring(capture_requested));
                 std::filesystem::create_directories(capture_folder);
-                spdlog::info("[PragmataAFWCaptureV3] folder={}", capture_folder.string());
+                spdlog::info("[PragmataAFWCaptureV4] folder={}", capture_folder.string());
             }
-            const auto eye_name = nEye == EyeLeft ? L"left" : L"right";
-            const auto save_texture = [&](ID3D12Resource* texture, D3D12_RESOURCE_STATES state, const wchar_t* kind) {
-                if (!texture) {
-                    spdlog::warn("[PragmataAFWCaptureV3] eye={} missing texture", static_cast<int>(nEye));
-                    return;
-                }
-                const auto file = capture_folder / (std::wstring(eye_name) + L"_" + kind + L".dds");
-                const auto desc = texture->GetDesc();
-                const auto hr = DirectX::SaveDDSTextureToFile(command_queue, texture, file.c_str(), state, state);
-                spdlog::info("[PragmataAFWCaptureV3] file={} eye={} frame={} texture={} size={}x{} format={} state={} hr={}",
-                    file.string(), static_cast<int>(nEye), frame_count, static_cast<void*>(texture),
-                    desc.Width, desc.Height, static_cast<int>(desc.Format), static_cast<unsigned int>(state),
-                    static_cast<long>(hr));
+            const auto allocate_snapshot = [&](ID3D12Resource* src, ComPtr<ID3D12Resource>& dst) {
+                auto desc = src->GetDesc();
+                desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+                const auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+                return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(dst.GetAddressOf()));
             };
-            save_texture(texDesc[texIndex].pTexture, texDesc[texIndex].initialState, L"scene_before_sharpen");
-            save_texture(vr->uiBufferDesc[0].pTexture, vr->uiBufferDesc[0].initialState, L"ui");
-            spdlog::info("[PragmataAFWCaptureV3] eye={} uiFix={} mode={} capturePending={}",
-                static_cast<int>(nEye), vr->m_enable_ui_fix->value(), vr->m_framewarp_mode->value(), capture_pending);
-            if (!capture_pending) spdlog::info("[PragmataAFWCaptureV3] capture finished; check per-file HRESULTs");
+            const auto scene_hr = allocate_snapshot(texDesc[texIndex].pTexture, capture_scene);
+            const auto ui_hr = allocate_snapshot(vr->uiBufferDesc[0].pTexture, capture_ui);
+            capture_this_frame = SUCCEEDED(scene_hr) && SUCCEEDED(ui_hr);
+            if (!capture_this_frame) {
+                capture_pending = 0;
+                spdlog::error("[PragmataAFWCaptureV4] snapshot allocation failed scene={} ui={}",
+                    static_cast<long>(scene_hr), static_cast<long>(ui_hr));
+            }
         } catch (const std::exception& e) {
             capture_pending = 0;
-            spdlog::error("[PragmataAFWCaptureV3] capture failed: {}", e.what());
+            spdlog::error("[PragmataAFWCaptureV4] capture failed: {}", e.what());
         }
     }
 #endif
 
     auto cmdList = vr->d3d12Renderer->BeginCommandList(backbuffer_index);
+#if defined(PRAGMATA)
+    if (capture_this_frame) {
+        // GPU snapshots are queued before AFW, with no CPU readback wait between input and output.
+        const auto snapshot = [&](ID3D12Resource* src, D3D12_RESOURCE_STATES state, ID3D12Resource* dst) {
+            auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(src, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cmdList->ResourceBarrier(1, &barrier);
+            cmdList->CopyResource(dst, src);
+            barrier = CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+            cmdList->ResourceBarrier(1, &barrier);
+        };
+        snapshot(texDesc[texIndex].pTexture, texDesc[texIndex].initialState, capture_scene.Get());
+        snapshot(vr->uiBufferDesc[0].pTexture, vr->uiBufferDesc[0].initialState, capture_ui.Get());
+    }
+#endif
+
 
     if ((vr->is_using_any_afw()) && m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture && vr->depthTex[0]) {
         static FrameBufferDesc s_CurrentEyeFrameBuffer{};
@@ -374,6 +385,38 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     }
 
     vr->d3d12Renderer->EndCommandList(backbuffer_index);
+#if defined(PRAGMATA)
+    if (capture_this_frame) {
+        try {
+            const auto origin = nEye == EyeLeft ? L"from_left_" : L"from_right_";
+            const auto save = [&](ID3D12Resource* tex, D3D12_RESOURCE_STATES state, const wchar_t* name) {
+                if (!tex) return;
+                const auto file = capture_folder / (std::wstring(origin) + name + L".dds");
+                const auto desc = tex->GetDesc();
+                const auto hr = DirectX::SaveDDSTextureToFile(command_queue, tex, file.c_str(), state, state);
+                spdlog::info("[PragmataAFWCaptureV4] file={} inputEye={} frame={} texture={} size={}x{} format={} state={} hr={}",
+                    file.string(), static_cast<int>(nEye), frame_count, static_cast<void*>(tex),
+                    desc.Width, desc.Height, static_cast<int>(desc.Format), static_cast<unsigned int>(state),
+                    static_cast<long>(hr));
+            };
+            // Output states match the existing OpenXR submission copies below.
+            save(m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture,
+                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, L"output_left");
+            save(m_eyeFrameBuffers.eyeFrameBuffers[1].color.pTexture,
+                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, L"output_right");
+            save(capture_scene.Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"input_scene");
+            save(capture_ui.Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"input_ui");
+            spdlog::info("[PragmataAFWCaptureV4] inputEye={} uiFix={} isHudless={} mode={} capturePending={}",
+                static_cast<int>(nEye), vr->m_enable_ui_fix->value(), params.IsHudlessColor,
+                vr->m_framewarp_mode->value(), capture_pending);
+            if (!capture_pending) spdlog::info("[PragmataAFWCaptureV4] finished; check file HRESULTs");
+        } catch (const std::exception& e) {
+            capture_pending = 0;
+            spdlog::error("[PragmataAFWCaptureV4] output capture failed: {}", e.what());
+        }
+    }
+#endif
+
 
     //#############################
     //#Frame Warp Module End
