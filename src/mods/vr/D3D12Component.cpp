@@ -1,4 +1,8 @@
 #include <openvr.h>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <../../directxtk12-src/Inc/ScreenGrab.h>
 #include <utility/ScopeGuard.hpp>
 
 #include "../VR.hpp"
@@ -62,20 +66,20 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     auto runtime = vr->get_runtime();
 #if defined(PRAGMATA)
-    // Diagnostic only; does not change HUD layout or AFW inputs.
-    static bool ui_probe_key_down = false;
-    static bool ui_probe_active = false;
-    static ULONGLONG ui_probe_started = 0;
-    const bool ui_probe_key_now = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (ui_probe_key_now && !ui_probe_key_down) {
-        ui_probe_active = !ui_probe_active;
-        ui_probe_started = GetTickCount64();
-        spdlog::info("[PragmataAFWHudlessProbeV2] testRequested={} (F8; automatic return after 20s)", ui_probe_active);
+    static bool capture_key_down = false;
+    static unsigned int capture_pending = 0;
+    static ULONGLONG capture_requested = 0;
+    static std::filesystem::path capture_folder;
+    const bool capture_key_now = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (capture_key_now && !capture_key_down && capture_pending == 0) {
+        capture_requested = GetTickCount64();
+        capture_pending = 3;
+        spdlog::info("[PragmataAFWCaptureV3] armed; capture in 3 seconds; no AFW parameters changed");
     }
-    ui_probe_key_down = ui_probe_key_now;
-    if (ui_probe_active && GetTickCount64() - ui_probe_started >= 20000) {
-        ui_probe_active = false;
-        spdlog::info("[PragmataAFWHudlessProbeV2] testRequested=false (timeout)");
+    capture_key_down = capture_key_now;
+    if (capture_pending && GetTickCount64() - capture_requested > 15000) {
+        capture_pending = 0;
+        spdlog::warn("[PragmataAFWCaptureV3] capture expired before both eyes were saved");
     }
 #endif
 
@@ -153,6 +157,51 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
+#if defined(PRAGMATA)
+    // Save unsharpened scene and UI inputs BEFORE recording AFW work or clearing UI.
+    // Each texture returns to its declared state. Never overwrite eye/history textures.
+    const unsigned int capture_bit = 1u << static_cast<unsigned int>(nEye);
+    if ((capture_pending & capture_bit) && GetTickCount64() - capture_requested >= 3000 &&
+        vr->is_using_any_afw() && !vr->is_foveated_rendering() && vr->depthTex[0]) {
+        capture_pending &= ~capture_bit;
+        try {
+            if (capture_pending == (3u & ~capture_bit)) {
+                wchar_t exe_path[32768]{};
+                const auto path_length = GetModuleFileNameW(nullptr, exe_path, 32768);
+                if (!path_length || path_length >= 32768) {
+                    throw std::runtime_error("Cannot resolve game executable directory");
+                }
+                capture_folder = std::filesystem::path(exe_path).parent_path() /
+                    L"reframework" / L"data" / (L"afw_capture_" + std::to_wstring(capture_requested));
+                std::filesystem::create_directories(capture_folder);
+                spdlog::info("[PragmataAFWCaptureV3] folder={}", capture_folder.string());
+            }
+            const auto eye_name = nEye == EyeLeft ? L"left" : L"right";
+            const auto save_texture = [&](ID3D12Resource* texture, D3D12_RESOURCE_STATES state, const wchar_t* kind) {
+                if (!texture) {
+                    spdlog::warn("[PragmataAFWCaptureV3] eye={} missing texture", static_cast<int>(nEye));
+                    return;
+                }
+                const auto file = capture_folder / (std::wstring(eye_name) + L"_" + kind + L".dds");
+                const auto desc = texture->GetDesc();
+                const auto hr = DirectX::SaveDDSTextureToFile(command_queue, texture, file.c_str(), state, state);
+                spdlog::info("[PragmataAFWCaptureV3] file={} eye={} frame={} texture={} size={}x{} format={} state={} hr={}",
+                    file.string(), static_cast<int>(nEye), frame_count, static_cast<void*>(texture),
+                    desc.Width, desc.Height, static_cast<int>(desc.Format), static_cast<unsigned int>(state),
+                    static_cast<long>(hr));
+            };
+            save_texture(texDesc[texIndex].pTexture, texDesc[texIndex].initialState, L"scene_before_sharpen");
+            save_texture(vr->uiBufferDesc[0].pTexture, vr->uiBufferDesc[0].initialState, L"ui");
+            spdlog::info("[PragmataAFWCaptureV3] eye={} uiFix={} mode={} capturePending={}",
+                static_cast<int>(nEye), vr->m_enable_ui_fix->value(), vr->m_framewarp_mode->value(), capture_pending);
+            if (!capture_pending) spdlog::info("[PragmataAFWCaptureV3] capture finished; check per-file HRESULTs");
+        } catch (const std::exception& e) {
+            capture_pending = 0;
+            spdlog::error("[PragmataAFWCaptureV3] capture failed: {}", e.what());
+        }
+    }
+#endif
+
     auto cmdList = vr->d3d12Renderer->BeginCommandList(backbuffer_index);
 
     if ((vr->is_using_any_afw()) && m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture && vr->depthTex[0]) {
@@ -194,35 +243,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 vr->d3d12Renderer->Sharpen(cmdList, eyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color, vr->get_sharpness());
                 s_CurrentEyeFrameBuffer.color = eyeFrameBuffer.color;
             }
-#if defined(PRAGMATA)
-            static unsigned int ui_probe_samples = 0;
-            static unsigned int ui_probe_draws = 0;
-            if (ui_probe_samples < 12 && (++ui_probe_draws % 181) == 0) {
-                const auto ui = params.InUIColorAlpha;
-                const auto texture = ui ? ui->pTexture : nullptr;
-                const auto desc = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
-                spdlog::info("[PragmataAFWHudlessProbeV2] eye={} uiFix={} supplied={} texture={} size={}x{} format={} isHudless={} mode={}",
-                    static_cast<int>(nEye), vr->m_enable_ui_fix->value(), ui != nullptr,
-                    static_cast<void*>(texture), desc.Width, desc.Height, static_cast<int>(desc.Format),
-                    params.IsHudlessColor, static_cast<int>(params.Mode));
-                ++ui_probe_samples;
-            }
-#endif
-#if defined(PRAGMATA)
-            // Isolate only the plugin's scene-contains-UI assumption.
-            // UI input, descriptor setup, clearing and output buffers remain unchanged.
-            if (ui_probe_active && params.InUIColorAlpha && params.InUIColorAlpha->pTexture) {
-                params.IsHudlessColor = true;
-            }
-            static int ui_probe_last_state = -1;
-            const int ui_probe_state = ui_probe_active ? (params.InUIColorAlpha ? 1 : 2) : 0;
-            if (ui_probe_state != ui_probe_last_state) {
-                spdlog::info("[PragmataAFWHudlessProbeV2] effectiveTest={} uiSupplied={} isHudless={} mode={}",
-                    ui_probe_state == 1, params.InUIColorAlpha != nullptr,
-                    params.IsHudlessColor, static_cast<int>(params.Mode));
-                ui_probe_last_state = ui_probe_state;
-            }
-#endif
             EvaluateFrameWarp(params);
 
         } else if (vr->is_using_afw_foveated()) {
