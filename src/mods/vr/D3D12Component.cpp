@@ -1,5 +1,7 @@
 #include <openvr.h>
 #include <chrono>
+#include <fstream>
+#include <MinHook.h>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -13,6 +15,172 @@
 #include <../../directxtk12-src/Src/d3dx12.h>
 
 #include "D3D12Component.hpp"
+
+#if defined(PRAGMATA)
+namespace pragmata_resolve_capture {
+using Microsoft::WRL::ComPtr;
+struct Context {
+    ID3D12GraphicsCommandList* cmd{};
+    ID3D12PipelineState* target{};
+    ID3D12PipelineState* current{};
+    ID3D12Resource* output[2]{};
+    ComPtr<ID3D12Resource> before[2], after[2];
+    D3D12_RESOURCE_STATES state[2]{};
+    bool known[2]{};
+    bool captured{};
+    unsigned int matches{};
+};
+static thread_local Context* active = nullptr;
+using DispatchFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+using PipelineFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using BarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+static DispatchFn original_dispatch{};
+static PipelineFn original_pipeline{};
+static BarrierFn original_barrier{};
+
+static void STDMETHODCALLTYPE pipeline_hook(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso) {
+    if (active && active->cmd == cmd) active->current = pso;
+    original_pipeline(cmd, pso);
+}
+static void STDMETHODCALLTYPE barrier_hook(ID3D12GraphicsCommandList* cmd, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+    if (active && active->cmd == cmd) {
+        for (UINT j = 0; j < count; ++j) {
+            const auto& b = barriers[j];
+            if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+            for (int i = 0; i < 2; ++i) {
+                if (b.Transition.pResource != active->output[i]) continue;
+                if (b.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
+                    (b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != 0)) {
+                    active->known[i] = false;
+                } else {
+                    active->state[i] = b.Transition.StateAfter;
+                    active->known[i] = true;
+                }
+            }
+        }
+    }
+    original_barrier(cmd, count, barriers);
+}
+static void copy_outputs(Context& c, ComPtr<ID3D12Resource>* destinations) {
+    for (int i = 0; i < 2; ++i) {
+        const auto state = c.state[i];
+        // A state transition orders prior UAV writes before the copy.
+        // If already COPY_SOURCE, an explicit UAV barrier is unnecessary.
+        if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            auto b = CD3DX12_RESOURCE_BARRIER::Transition(c.output[i], state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            original_barrier(c.cmd, 1, &b);
+        }
+        c.cmd->CopyResource(destinations[i].Get(), c.output[i]);
+        if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            auto b = CD3DX12_RESOURCE_BARRIER::Transition(c.output[i], D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+            original_barrier(c.cmd, 1, &b);
+        }
+    }
+}
+static void STDMETHODCALLTYPE dispatch_hook(ID3D12GraphicsCommandList* cmd, UINT x, UINT y, UINT z) {
+    auto* c = active;
+    const bool target = c && c->cmd == cmd && c->current == c->target;
+    if (target) ++c->matches;
+    const bool capture = target && !c->captured && c->known[0] && c->known[1];
+    if (capture) copy_outputs(*c, c->before);
+    original_dispatch(cmd, x, y, z);
+    if (capture) {
+        copy_outputs(*c, c->after);
+        c->captured = true;
+        spdlog::info("[PragmataResolveV7] captured resolve dispatch={}x{}x{} states={},{}", x, y, z,
+            static_cast<unsigned int>(c->state[0]), static_cast<unsigned int>(c->state[1]));
+    }
+}
+
+static bool install(ID3D12GraphicsCommandList* cmd) {
+    static bool attempted = false;
+    static bool installed = false;
+    if (attempted) return installed;
+    attempted = true;
+    auto** vtable = *reinterpret_cast<void***>(cmd);
+    void* targets[]{vtable[14], vtable[25], vtable[26]};
+    void* hooks[]{reinterpret_cast<void*>(&dispatch_hook), reinterpret_cast<void*>(&pipeline_hook), reinterpret_cast<void*>(&barrier_hook)};
+    void** originals[]{reinterpret_cast<void**>(&original_dispatch), reinterpret_cast<void**>(&original_pipeline), reinterpret_cast<void**>(&original_barrier)};
+    unsigned int created = 0;
+    for (; created < 3; ++created) {
+        const auto result = MH_CreateHook(targets[created], hooks[created], originals[created]);
+        if (result != MH_OK) {
+            spdlog::error("[PragmataResolveV7] hook creation failed index={} status={}; stage capture disabled", created, static_cast<int>(result));
+            for (unsigned int i = 0; i < created; ++i) MH_RemoveHook(targets[i]);
+            return false;
+        }
+    }
+    for (unsigned int i = 0; i < 3; ++i) {
+        const auto result = MH_QueueEnableHook(targets[i]);
+        if (result != MH_OK) {
+            for (unsigned int j = 0; j < 3; ++j) MH_RemoveHook(targets[j]);
+            spdlog::error("[PragmataResolveV7] hook queue failed; stage capture disabled");
+            return false;
+        }
+    }
+    if (MH_ApplyQueued() != MH_OK) {
+        for (unsigned int i = 0; i < 3; ++i) { MH_DisableHook(targets[i]); MH_RemoveHook(targets[i]); }
+        spdlog::error("[PragmataResolveV7] hook enable failed; stage capture disabled");
+        return false;
+    }
+    installed = true;
+    spdlog::info("[PragmataResolveV7] command-list hooks installed; inactive outside requested AFW capture");
+    return true;
+}
+static ID3D12PipelineState* resolve_pso() {
+    static HMODULE verified_module = nullptr;
+    static bool attempted = false;
+    if (!attempted) {
+        attempted = true;
+        auto module = GetModuleHandleW(L"PDAFWPlugin.dll");
+        wchar_t path[32768]{};
+        const auto length = module ? GetModuleFileNameW(module, path, 32768) : 0;
+        if (!length || length >= 32768) return nullptr;
+        std::ifstream file(std::filesystem::path(path), std::ios::binary);
+        uint64_t hash = 14695981039346656037ull;
+        size_t size = 0;
+        char ch;
+        while (file.get(ch)) { hash = (hash ^ static_cast<unsigned char>(ch)) * 1099511628211ull; ++size; }
+        // Exact supplied beta6 file fingerprint, plus exported entrypoint validation.
+        if (!file.eof() || size != 534528 || hash != 0x094c5e71fccd8f6bull ||
+            GetProcAddress(module, "EvaluateFrameWarp") != reinterpret_cast<FARPROC>(reinterpret_cast<uintptr_t>(module) + 0x19ab0)) {
+            spdlog::error("[PragmataResolveV7] plugin fingerprint mismatch; stage capture disabled");
+            return nullptr;
+        }
+        verified_module = module;
+        spdlog::info("[PragmataResolveV7] beta6 plugin fingerprint verified");
+    }
+    if (!verified_module) return nullptr;
+    uintptr_t object = 0;
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(verified_module) + 0x99cf0), &object, sizeof(object), &read) || read != sizeof(object) || !object) return nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(object + 0x5c8), &pso, sizeof(pso), &read) || read != sizeof(pso)) return nullptr;
+    return pso;
+}
+static bool prepare(Context& c, ID3D12Device* device, ID3D12GraphicsCommandList* cmd, EyeFrameBuffers& buffers) {
+    c.target = resolve_pso();
+    if (!c.target || !install(cmd)) return false;
+    c.cmd = cmd;
+    for (int i = 0; i < 2; ++i) {
+        c.output[i] = buffers.eyeFrameBuffers[i].color.pTexture;
+        if (!c.output[i]) return false;
+        auto desc = c.output[i]->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1) return false;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(c.before[i].GetAddressOf()))) ||
+            FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(c.after[i].GetAddressOf())))) return false;
+    }
+    return true;
+}
+struct Scope {
+    Context* previous;
+    explicit Scope(Context* c) : previous(active) { active = c; }
+    ~Scope() { active = previous; }
+};
+}
+#endif
 
 namespace vrmod {
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
@@ -205,7 +373,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 const auto length = GetModuleFileNameW(nullptr, exe_path, 32768);
                 if (!length || length >= 32768) throw std::runtime_error("Cannot resolve game directory");
                 capture_folder = std::filesystem::path(exe_path).parent_path() /
-                    L"reframework" / L"data" / (L"afw_output_capture_" + std::to_wstring(capture_requested));
+                    L"reframework" / L"data" / (L"afw_resolve_capture_" + std::to_wstring(capture_requested));
                 std::filesystem::create_directories(capture_folder);
                 spdlog::info("[PragmataAFWCaptureV4] folder={}", capture_folder.string());
             }
@@ -232,6 +400,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 #endif
 
     auto cmdList = vr->d3d12Renderer->BeginCommandList(backbuffer_index);
+#if defined(PRAGMATA)
+    pragmata_resolve_capture::Context resolve_capture;
+    const bool resolve_ready = capture_this_frame && pragmata_resolve_capture::prepare(resolve_capture, device, cmdList, m_eyeFrameBuffers);
+    if (capture_this_frame && !resolve_ready) spdlog::warn("[PragmataResolveV7] stage capture unavailable; ordinary capture retained");
+#endif
 #if defined(PRAGMATA)
     if (capture_this_frame) {
         // GPU snapshots are queued before AFW, with no CPU readback wait between input and output.
@@ -272,18 +445,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         params.InMotionScale[1] = (float)colorDesc.Height;
         params.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
         params.EyeIndex = nEye;
-#if defined(PRAGMATA)
-        // Controlled V6 diagnostic: force the existing plugin clear path.
-        // Do not alter the ModToggle or persist a configuration change.
-        params.ClearBeforeWarping = true;
-        static bool clear_test_logged = false;
-        if (!clear_test_logged) {
-            spdlog::info("[PragmataAFWClearV6] active: ClearBeforeWarping=true; all other AFW parameters unchanged");
-            clear_test_logged = true;
-        }
-#else
         params.ClearBeforeWarping = vr->m_clear_before_framewarp->value();
-#endif
         params.CameraData = &vr->cameraData[nEye];
         params.IgnoreMotionThreshold = vr->m_ignore_motion_threshold->value();
         params.Debug = vr->m_framewarp_debug->value();
@@ -315,7 +477,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 startup_last_state = startup_state;
             }
 #endif
-            EvaluateFrameWarp(params);
+            {
+#if defined(PRAGMATA)
+                pragmata_resolve_capture::Scope scope(resolve_ready ? &resolve_capture : nullptr);
+#endif
+                EvaluateFrameWarp(params);
+            }
 
         } else if (vr->is_using_afw_foveated()) {
             auto foveatedVP = vr->get_runtime()->foveated_viewports[nEye];
@@ -427,7 +594,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 startup_last_state = startup_state;
             }
 #endif
-            EvaluateFrameWarp(params);
+            {
+#if defined(PRAGMATA)
+                pragmata_resolve_capture::Scope scope(resolve_ready ? &resolve_capture : nullptr);
+#endif
+                EvaluateFrameWarp(params);
+            }
         }
 
         for (int i = 0; i < 2; i++) {
@@ -482,6 +654,15 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, L"output_left");
             save(m_eyeFrameBuffers.eyeFrameBuffers[1].color.pTexture,
                 D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, L"output_right");
+            if (resolve_capture.captured) {
+                save(resolve_capture.before[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"before_resolve_left");
+                save(resolve_capture.before[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"before_resolve_right");
+                save(resolve_capture.after[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"after_resolve_left");
+                save(resolve_capture.after[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"after_resolve_right");
+            }
+            spdlog::info("[PragmataResolveV7] eye={} ready={} matches={} captured={} known={},{}",
+                static_cast<int>(nEye), resolve_ready, resolve_capture.matches, resolve_capture.captured,
+                resolve_capture.known[0], resolve_capture.known[1]);
             save(capture_scene.Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"input_scene");
             save(capture_ui.Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"input_ui");
             spdlog::info("[PragmataAFWCaptureV4] inputEye={} uiFix={} isHudless={} mode={} capturePending={}",
@@ -1274,4 +1455,5 @@ void D3D12Component::OpenXR::copy(
     }
 }
 } // namespace vrmod
+
 
