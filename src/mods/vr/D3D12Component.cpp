@@ -25,12 +25,17 @@ struct TrackedSource {
     bool known{};
 };
 struct Context {
+    bool diagnostic{};
+    bool fix_history{};
+    bool history_ready{};
+    UINT64 current_ui{}, previous_ui{};
+
     ID3D12Device* device{};
     uintptr_t object{};
     ID3D12PipelineState* scatter{};
     UINT64 roots[8]{};
     UINT64 banks[4]{};
-    TrackedSource sources[3]{};
+    TrackedSource sources[4]{};
     ComPtr<ID3D12Resource> scatter_source[2], scatter_ui[2];
     unsigned int scatter_count{};
 
@@ -55,11 +60,33 @@ static BarrierFn original_barrier{};
 using TableFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
 static TableFn original_table{};
 static void STDMETHODCALLTYPE table_hook(ID3D12GraphicsCommandList* cmd, UINT slot, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
-    if (active && active->cmd == cmd && slot < 8) active->roots[slot] = handle.ptr;
+    auto* c = active;
+    if (c && c->cmd == cmd && slot < 8) c->roots[slot] = handle.ptr;
     original_table(cmd, slot, handle);
+    if (c && c->fix_history && c->cmd == cmd && slot == 7) {
+        bool history = handle.ptr == c->banks[2] || handle.ptr == c->banks[3];
+        const UINT64 ui = history ? c->previous_ui : c->current_ui;
+        original_table(cmd, 1, D3D12_GPU_DESCRIPTOR_HANDLE{ui});
+        c->roots[1] = ui;
+    }
 }
-
-
+using ConstantsFn = void(__fastcall*)(void*, int, int, bool);
+static ConstantsFn original_constants{};
+static void __fastcall constants_hook(void* object, int source, int destination, bool history) {
+    auto* c = active;
+    if (!c || !c->fix_history || reinterpret_cast<uintptr_t>(object) != c->object || !history ||
+        destination < 2 || destination > 3) {
+        original_constants(object, source, destination, history);
+        return;
+    }
+    auto* flag = reinterpret_cast<unsigned char*>(reinterpret_cast<uintptr_t>(object) + 0x19a);
+    const auto saved = *flag;
+    *flag = 1;
+    original_constants(object, source, destination, history);
+    *flag = saved;
+    if (c->diagnostic) spdlog::info("[PragmataHistoryV10] enabled matching-history UI protection bank={}", destination);
+}
+static uintptr_t verified_base{};
 static void STDMETHODCALLTYPE pipeline_hook(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso) {
     if (active && active->cmd == cmd) active->current = pso;
     original_pipeline(cmd, pso);
@@ -115,7 +142,7 @@ static bool copy_source(Context& c, UINT64 handle, ComPtr<ID3D12Resource>& desti
         }
     }
     if (!found || !found->known) {
-        spdlog::warn("[PragmataResolveV9] pass={} {} handle={} resource/state unknown; skipped", pass, label, handle);
+        spdlog::warn("[PragmataHistoryV10] pass={} {} handle={} resource/state unknown; skipped", pass, label, handle);
         return false;
     }
     auto desc = found->desc.pTexture->GetDesc();
@@ -135,7 +162,7 @@ static bool copy_source(Context& c, UINT64 handle, ComPtr<ID3D12Resource>& desti
         auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(found->desc.pTexture, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
         original_barrier(c.cmd, 1, &barrier);
     }
-    spdlog::info("[PragmataResolveV9] pass={} {} resource={} handle={} state={} copied",
+    spdlog::info("[PragmataHistoryV10] pass={} {} resource={} handle={} state={} copied",
         pass, label, static_cast<void*>(found->desc.pTexture), handle, static_cast<unsigned int>(state));
     return true;
 }
@@ -149,20 +176,20 @@ static void capture_scatter(Context& c) {
     const bool valid_flag = bank >= 0 && ReadProcessMemory(GetCurrentProcess(),
         reinterpret_cast<const void*>(c.object + 0xf6c + static_cast<uintptr_t>(bank) * 0x978),
         &flag, sizeof(flag), &count) && count == sizeof(flag);
-    spdlog::info("[PragmataResolveV9] scatter={} root0={} root1={} root7={} bank={} uiProtection={} flagRead={}",
+    spdlog::info("[PragmataHistoryV10] scatter={} root0={} root1={} root7={} bank={} uiProtection={} flagRead={}",
         pass, c.roots[0], c.roots[1], c.roots[7], bank, flag, valid_flag);
     copy_source(c, c.roots[0], c.scatter_source[pass], "source", pass);
     copy_source(c, c.roots[1], c.scatter_ui[pass], "ui", pass);
 }
 static void STDMETHODCALLTYPE dispatch_hook(ID3D12GraphicsCommandList* cmd, UINT x, UINT y, UINT z) {
     auto* c = active;
-    if (c && c->cmd == cmd && c->current == c->scatter) capture_scatter(*c);
-    const bool target = c && c->cmd == cmd && c->current == c->target;
+    if (c && c->diagnostic && c->cmd == cmd && c->current == c->scatter) capture_scatter(*c);
+    const bool target = c && c->diagnostic && c->cmd == cmd && c->current == c->target;
     if (target) ++c->matches;
     const unsigned int mask = target && !c->captured ?
         (c->known[0] ? 1u : 0u) | (c->known[1] ? 2u : 0u) : 0u;
     const bool capture = mask != 0;
-    if (target) spdlog::info("[PragmataResolveV9] at dispatch known={},{} states={},{} mask={}",
+    if (target) spdlog::info("[PragmataHistoryV10] at dispatch known={},{} states={},{} mask={}",
         c->known[0], c->known[1], static_cast<unsigned int>(c->state[0]), static_cast<unsigned int>(c->state[1]), mask);
     if (capture) copy_outputs(*c, c->before, mask);
     original_dispatch(cmd, x, y, z);
@@ -170,7 +197,7 @@ static void STDMETHODCALLTYPE dispatch_hook(ID3D12GraphicsCommandList* cmd, UINT
         copy_outputs(*c, c->after, mask);
         c->capture_mask = mask;
         c->captured = true;
-        spdlog::info("[PragmataResolveV9] captured resolve dispatch={}x{}x{} states={},{}", x, y, z,
+        spdlog::info("[PragmataHistoryV10] captured resolve dispatch={}x{}x{} states={},{}", x, y, z,
             static_cast<unsigned int>(c->state[0]), static_cast<unsigned int>(c->state[1]));
     }
 }
@@ -181,33 +208,33 @@ static bool install(ID3D12GraphicsCommandList* cmd) {
     if (attempted) return installed;
     attempted = true;
     auto** vtable = *reinterpret_cast<void***>(cmd);
-    void* targets[]{vtable[14], vtable[25], vtable[26], vtable[31]};
-    void* hooks[]{reinterpret_cast<void*>(&dispatch_hook), reinterpret_cast<void*>(&pipeline_hook), reinterpret_cast<void*>(&barrier_hook), reinterpret_cast<void*>(&table_hook)};
-    void** originals[]{reinterpret_cast<void**>(&original_dispatch), reinterpret_cast<void**>(&original_pipeline), reinterpret_cast<void**>(&original_barrier), reinterpret_cast<void**>(&original_table)};
+    void* targets[]{vtable[14], vtable[25], vtable[26], vtable[31], reinterpret_cast<void*>(verified_base + 0x19e00)};
+    void* hooks[]{reinterpret_cast<void*>(&dispatch_hook), reinterpret_cast<void*>(&pipeline_hook), reinterpret_cast<void*>(&barrier_hook), reinterpret_cast<void*>(&table_hook), reinterpret_cast<void*>(&constants_hook)};
+    void** originals[]{reinterpret_cast<void**>(&original_dispatch), reinterpret_cast<void**>(&original_pipeline), reinterpret_cast<void**>(&original_barrier), reinterpret_cast<void**>(&original_table), reinterpret_cast<void**>(&original_constants)};
     unsigned int created = 0;
-    for (; created < 4; ++created) {
+    for (; created < 5; ++created) {
         const auto result = MH_CreateHook(targets[created], hooks[created], originals[created]);
         if (result != MH_OK) {
-            spdlog::error("[PragmataResolveV9] hook creation failed index={} status={}; stage capture disabled", created, static_cast<int>(result));
+            spdlog::error("[PragmataHistoryV10] hook creation failed index={} status={}; stage capture disabled", created, static_cast<int>(result));
             for (unsigned int i = 0; i < created; ++i) MH_RemoveHook(targets[i]);
             return false;
         }
     }
-    for (unsigned int i = 0; i < 4; ++i) {
+    for (unsigned int i = 0; i < 5; ++i) {
         const auto result = MH_QueueEnableHook(targets[i]);
         if (result != MH_OK) {
-            for (unsigned int j = 0; j < 4; ++j) MH_RemoveHook(targets[j]);
-            spdlog::error("[PragmataResolveV9] hook queue failed; stage capture disabled");
+            for (unsigned int j = 0; j < 5; ++j) MH_RemoveHook(targets[j]);
+            spdlog::error("[PragmataHistoryV10] hook queue failed; stage capture disabled");
             return false;
         }
     }
     if (MH_ApplyQueued() != MH_OK) {
-        for (unsigned int i = 0; i < 4; ++i) { MH_DisableHook(targets[i]); MH_RemoveHook(targets[i]); }
-        spdlog::error("[PragmataResolveV9] hook enable failed; stage capture disabled");
+        for (unsigned int i = 0; i < 5; ++i) { MH_DisableHook(targets[i]); MH_RemoveHook(targets[i]); }
+        spdlog::error("[PragmataHistoryV10] hook enable failed; stage capture disabled");
         return false;
     }
     installed = true;
-    spdlog::info("[PragmataResolveV9] command-list hooks installed; inactive outside requested AFW capture");
+    spdlog::info("[PragmataHistoryV10] command-list hooks installed; history correction active only inside eligible AFW calls");
     return true;
 }
 static uintptr_t verified_object{};
@@ -228,11 +255,12 @@ static ID3D12PipelineState* resolve_pso() {
         // Exact supplied beta6 file fingerprint, plus exported entrypoint validation.
         if (!file.eof() || size != 534528 || hash != 0x094c5e71fccd8f6bull ||
             GetProcAddress(module, "EvaluateFrameWarp") != reinterpret_cast<FARPROC>(reinterpret_cast<uintptr_t>(module) + 0x19ab0)) {
-            spdlog::error("[PragmataResolveV9] plugin fingerprint mismatch; stage capture disabled");
+            spdlog::error("[PragmataHistoryV10] plugin fingerprint mismatch; stage capture disabled");
             return nullptr;
         }
         verified_module = module;
-        spdlog::info("[PragmataResolveV9] beta6 plugin fingerprint verified");
+        verified_base = reinterpret_cast<uintptr_t>(module);
+        spdlog::info("[PragmataHistoryV10] beta6 plugin fingerprint verified");
     }
     if (!verified_module) return nullptr;
     uintptr_t object = 0;
@@ -243,7 +271,8 @@ static ID3D12PipelineState* resolve_pso() {
     verified_object = object;
     return pso;
 }
-static bool prepare(Context& c, ID3D12Device* device, ID3D12GraphicsCommandList* cmd, EyeFrameBuffers& buffers) {
+static bool prepare(Context& c, ID3D12Device* device, ID3D12GraphicsCommandList* cmd, EyeFrameBuffers& buffers, bool diagnostic) {
+    c.diagnostic = diagnostic;
     c.target = resolve_pso();
     if (!c.target || !install(cmd)) return false;
     c.cmd = cmd;
@@ -259,8 +288,9 @@ static bool prepare(Context& c, ID3D12Device* device, ID3D12GraphicsCommandList*
         // Use that explicit contract until an observed transition updates it.
         c.state[i] = buffers.eyeFrameBuffers[i].color.initialState;
         c.known[i] = c.state[i] == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
-        spdlog::info("[PragmataResolveV9] eye={} descriptor state={} seeded={}",
+        if (c.diagnostic) spdlog::info("[PragmataHistoryV10] eye={} descriptor state={} seeded={}",
             i, static_cast<unsigned int>(c.state[i]), c.known[i]);
+        if (!c.diagnostic) continue;
         auto desc = c.output[i]->GetDesc();
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1) return false;
         desc.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -270,27 +300,89 @@ static bool prepare(Context& c, ID3D12Device* device, ID3D12GraphicsCommandList*
     }
     return true;
 }
+struct History {
+    TextureDesc mask{};
+    ID3D12Device* device{};
+    uintptr_t object{};
+    uint64_t frame{};
+    int eye{-1};
+    bool valid{};
+    UINT64 width{};
+    UINT height{};
+    DXGI_FORMAT format{};
+};
+static History history_mask;
 struct Scope {
     Context* previous;
-    explicit Scope(Context* c, FrameWarpEvaluateParams& params, D3D12RendererAPI* renderer) : previous(active) {
+    Context* context;
+    FrameWarpEvaluateParams& params;
+    D3D12RendererAPI* renderer;
+    uint64_t frame;
+    bool eligible{};
+    explicit Scope(Context* c, FrameWarpEvaluateParams& p, D3D12RendererAPI* r, uint64_t f)
+        : previous(active), context(c), params(p), renderer(r), frame(f) {
         if (c) {
             static_assert(sizeof(TextureDesc) == 56, "Unexpected plugin descriptor layout");
-            if (params.InEyeFrameBuffer) c->sources[0].desc = params.InEyeFrameBuffer->color;
-            if (params.InUIColorAlpha) c->sources[1].desc = *params.InUIColorAlpha;
+            if (p.InEyeFrameBuffer) c->sources[0].desc = p.InEyeFrameBuffer->color;
+            if (p.InUIColorAlpha) c->sources[1].desc = *p.InUIColorAlpha;
             SIZE_T read = 0;
             if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c->object + 0x2f8),
                 &c->sources[2].desc, sizeof(TextureDesc), &read) || read != sizeof(TextureDesc)) c->sources[2].desc = {};
+            for (int i = 0; i < 4; ++i) c->banks[i] = r->GetGPUDescriptorHandle(80000 + i).ptr;
+            eligible = static_cast<int>(p.Mode) == 3 && !p.isFoveated && !p.IsHudlessColor &&
+                p.InUIColorAlpha && p.InUIColorAlpha->pTexture && p.InEyeFrameBuffer;
+            if (eligible) {
+                const auto d = p.InUIColorAlpha->pTexture->GetDesc();
+                auto& h = history_mask;
+                eligible = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    d.MipLevels == 1 && d.DepthOrArraySize == 1 && d.SampleDesc.Count == 1;
+                if (eligible && (h.device != c->device || h.object != c->object ||
+                    h.width != d.Width || h.height != d.Height || h.format != d.Format || !h.mask.pTexture)) {
+                    // The plugin renderer owns created textures, as with its other TextureDesc allocations.
+                    h = {};
+                    h.device = c->device; h.object = c->object;
+                    h.width = d.Width; h.height = d.Height; h.format = d.Format;
+                    eligible = r->CreateTexture(static_cast<int>(d.Width), static_cast<int>(d.Height),
+                        d.Format, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, h.mask, false);
+                }
+                eligible = eligible && h.mask.pTexture && h.mask.shaderResourceViewHandle.ptr;
+                if (eligible) {
+                    c->history_ready = true;
+                    c->current_ui = p.InUIColorAlpha->shaderResourceViewHandle.ptr;
+                    c->previous_ui = h.mask.shaderResourceViewHandle.ptr;
+                    c->fix_history = h.valid && h.frame + 1 == frame && h.eye != static_cast<int>(p.EyeIndex) &&
+                        c->current_ui && c->previous_ui;
+                    c->sources[3].desc = h.mask;
+                    static bool announced = false;
+                    if (c->fix_history && !announced) {
+                        spdlog::info("[PragmataHistoryV10] matching previous-frame HUD mask correction active");
+                        announced = true;
+                    }
+                }
+            }
             for (auto& src : c->sources) {
                 src.state = src.desc.initialState;
                 src.known = src.desc.pTexture && (src.state == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE ||
                     src.state == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE || src.state == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
             }
-            for (int i = 0; i < 4; ++i) c->banks[i] = renderer->GetGPUDescriptorHandle(80000 + i).ptr;
+            if (c->diagnostic) spdlog::info("[PragmataHistoryV10] frame={} historyCorrection={} eligible={}", frame, c->fix_history, eligible);
         }
         active = c;
     }
-    ~Scope() { active = previous; }
+    ~Scope() {
+        active = previous;
+        if (context && eligible && context->history_ready) {
+            // Preserve this UI after all AFW reads, before the caller clears the UI texture.
+            renderer->Copy(context->cmd, history_mask.mask, *params.InUIColorAlpha);
+            history_mask.frame = frame;
+            history_mask.eye = static_cast<int>(params.EyeIndex);
+            history_mask.valid = true;
+        } else {
+            history_mask.valid = false;
+        }
+    }
 };
+
 }
 #endif
 
@@ -485,7 +577,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 const auto length = GetModuleFileNameW(nullptr, exe_path, 32768);
                 if (!length || length >= 32768) throw std::runtime_error("Cannot resolve game directory");
                 capture_folder = std::filesystem::path(exe_path).parent_path() /
-                    L"reframework" / L"data" / (L"afw_source_v9_capture_" + std::to_wstring(capture_requested));
+                    L"reframework" / L"data" / (L"afw_history_v10_capture_" + std::to_wstring(capture_requested));
                 std::filesystem::create_directories(capture_folder);
                 spdlog::info("[PragmataAFWCaptureV4] folder={}", capture_folder.string());
             }
@@ -514,8 +606,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     auto cmdList = vr->d3d12Renderer->BeginCommandList(backbuffer_index);
 #if defined(PRAGMATA)
     pragmata_resolve_capture::Context resolve_capture;
-    const bool resolve_ready = capture_this_frame && pragmata_resolve_capture::prepare(resolve_capture, device, cmdList, m_eyeFrameBuffers);
-    if (capture_this_frame && !resolve_ready) spdlog::warn("[PragmataResolveV9] stage capture unavailable; ordinary capture retained");
+    const bool resolve_ready = vr->is_using_any_afw() && pragmata_resolve_capture::prepare(resolve_capture, device, cmdList, m_eyeFrameBuffers, capture_this_frame);
+    if (capture_this_frame && !resolve_ready) spdlog::warn("[PragmataHistoryV10] stage capture unavailable; ordinary capture retained");
 #endif
 #if defined(PRAGMATA)
     if (capture_this_frame) {
@@ -591,7 +683,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 #endif
             {
 #if defined(PRAGMATA)
-                pragmata_resolve_capture::Scope scope(resolve_ready ? &resolve_capture : nullptr, params, vr->d3d12Renderer);
+                pragmata_resolve_capture::Scope scope(resolve_ready ? &resolve_capture : nullptr, params, vr->d3d12Renderer, frame_count);
 #endif
                 EvaluateFrameWarp(params);
             }
@@ -708,7 +800,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 #endif
             {
 #if defined(PRAGMATA)
-                pragmata_resolve_capture::Scope scope(resolve_ready ? &resolve_capture : nullptr, params, vr->d3d12Renderer);
+                pragmata_resolve_capture::Scope scope(resolve_ready ? &resolve_capture : nullptr, params, vr->d3d12Renderer, frame_count);
 #endif
                 EvaluateFrameWarp(params);
             }
@@ -781,7 +873,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     save(resolve_capture.after[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"after_resolve_right");
                 }
             }
-            spdlog::info("[PragmataResolveV9] eye={} ready={} matches={} captured={} known={},{}",
+            spdlog::info("[PragmataHistoryV10] eye={} ready={} matches={} captured={} known={},{}",
                 static_cast<int>(nEye), resolve_ready, resolve_capture.matches, resolve_capture.captured,
                 resolve_capture.known[0], resolve_capture.known[1]);
             save(capture_scene.Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"input_scene");
