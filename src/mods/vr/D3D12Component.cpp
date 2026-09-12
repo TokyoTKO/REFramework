@@ -28,6 +28,7 @@ struct Context {
     D3D12_RESOURCE_STATES state[2]{};
     bool known[2]{};
     bool captured{};
+    unsigned int capture_mask{};
     unsigned int matches{};
 };
 static thread_local Context* active = nullptr;
@@ -61,8 +62,9 @@ static void STDMETHODCALLTYPE barrier_hook(ID3D12GraphicsCommandList* cmd, UINT 
     }
     original_barrier(cmd, count, barriers);
 }
-static void copy_outputs(Context& c, ComPtr<ID3D12Resource>* destinations) {
+static void copy_outputs(Context& c, ComPtr<ID3D12Resource>* destinations, unsigned int mask) {
     for (int i = 0; i < 2; ++i) {
+        if (!(mask & (1u << i))) continue;
         const auto state = c.state[i];
         // A state transition orders prior UAV writes before the copy.
         // If already COPY_SOURCE, an explicit UAV barrier is unnecessary.
@@ -81,13 +83,18 @@ static void STDMETHODCALLTYPE dispatch_hook(ID3D12GraphicsCommandList* cmd, UINT
     auto* c = active;
     const bool target = c && c->cmd == cmd && c->current == c->target;
     if (target) ++c->matches;
-    const bool capture = target && !c->captured && c->known[0] && c->known[1];
-    if (capture) copy_outputs(*c, c->before);
+    const unsigned int mask = target && !c->captured ?
+        (c->known[0] ? 1u : 0u) | (c->known[1] ? 2u : 0u) : 0u;
+    const bool capture = mask != 0;
+    if (target) spdlog::info("[PragmataResolveV8] at dispatch known={},{} states={},{} mask={}",
+        c->known[0], c->known[1], static_cast<unsigned int>(c->state[0]), static_cast<unsigned int>(c->state[1]), mask);
+    if (capture) copy_outputs(*c, c->before, mask);
     original_dispatch(cmd, x, y, z);
     if (capture) {
-        copy_outputs(*c, c->after);
+        copy_outputs(*c, c->after, mask);
+        c->capture_mask = mask;
         c->captured = true;
-        spdlog::info("[PragmataResolveV7] captured resolve dispatch={}x{}x{} states={},{}", x, y, z,
+        spdlog::info("[PragmataResolveV8] captured resolve dispatch={}x{}x{} states={},{}", x, y, z,
             static_cast<unsigned int>(c->state[0]), static_cast<unsigned int>(c->state[1]));
     }
 }
@@ -105,7 +112,7 @@ static bool install(ID3D12GraphicsCommandList* cmd) {
     for (; created < 3; ++created) {
         const auto result = MH_CreateHook(targets[created], hooks[created], originals[created]);
         if (result != MH_OK) {
-            spdlog::error("[PragmataResolveV7] hook creation failed index={} status={}; stage capture disabled", created, static_cast<int>(result));
+            spdlog::error("[PragmataResolveV8] hook creation failed index={} status={}; stage capture disabled", created, static_cast<int>(result));
             for (unsigned int i = 0; i < created; ++i) MH_RemoveHook(targets[i]);
             return false;
         }
@@ -114,17 +121,17 @@ static bool install(ID3D12GraphicsCommandList* cmd) {
         const auto result = MH_QueueEnableHook(targets[i]);
         if (result != MH_OK) {
             for (unsigned int j = 0; j < 3; ++j) MH_RemoveHook(targets[j]);
-            spdlog::error("[PragmataResolveV7] hook queue failed; stage capture disabled");
+            spdlog::error("[PragmataResolveV8] hook queue failed; stage capture disabled");
             return false;
         }
     }
     if (MH_ApplyQueued() != MH_OK) {
         for (unsigned int i = 0; i < 3; ++i) { MH_DisableHook(targets[i]); MH_RemoveHook(targets[i]); }
-        spdlog::error("[PragmataResolveV7] hook enable failed; stage capture disabled");
+        spdlog::error("[PragmataResolveV8] hook enable failed; stage capture disabled");
         return false;
     }
     installed = true;
-    spdlog::info("[PragmataResolveV7] command-list hooks installed; inactive outside requested AFW capture");
+    spdlog::info("[PragmataResolveV8] command-list hooks installed; inactive outside requested AFW capture");
     return true;
 }
 static ID3D12PipelineState* resolve_pso() {
@@ -144,11 +151,11 @@ static ID3D12PipelineState* resolve_pso() {
         // Exact supplied beta6 file fingerprint, plus exported entrypoint validation.
         if (!file.eof() || size != 534528 || hash != 0x094c5e71fccd8f6bull ||
             GetProcAddress(module, "EvaluateFrameWarp") != reinterpret_cast<FARPROC>(reinterpret_cast<uintptr_t>(module) + 0x19ab0)) {
-            spdlog::error("[PragmataResolveV7] plugin fingerprint mismatch; stage capture disabled");
+            spdlog::error("[PragmataResolveV8] plugin fingerprint mismatch; stage capture disabled");
             return nullptr;
         }
         verified_module = module;
-        spdlog::info("[PragmataResolveV7] beta6 plugin fingerprint verified");
+        spdlog::info("[PragmataResolveV8] beta6 plugin fingerprint verified");
     }
     if (!verified_module) return nullptr;
     uintptr_t object = 0;
@@ -165,6 +172,12 @@ static bool prepare(Context& c, ID3D12Device* device, ID3D12GraphicsCommandList*
     for (int i = 0; i < 2; ++i) {
         c.output[i] = buffers.eyeFrameBuffers[i].color.pTexture;
         if (!c.output[i]) return false;
+        // The plugin supplies each texture's resting state in its API descriptor.
+        // Use that explicit contract until an observed transition updates it.
+        c.state[i] = buffers.eyeFrameBuffers[i].color.initialState;
+        c.known[i] = c.state[i] == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        spdlog::info("[PragmataResolveV8] eye={} descriptor state={} seeded={}",
+            i, static_cast<unsigned int>(c.state[i]), c.known[i]);
         auto desc = c.output[i]->GetDesc();
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1) return false;
         desc.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -373,7 +386,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 const auto length = GetModuleFileNameW(nullptr, exe_path, 32768);
                 if (!length || length >= 32768) throw std::runtime_error("Cannot resolve game directory");
                 capture_folder = std::filesystem::path(exe_path).parent_path() /
-                    L"reframework" / L"data" / (L"afw_resolve_capture_" + std::to_wstring(capture_requested));
+                    L"reframework" / L"data" / (L"afw_resolve_v8_capture_" + std::to_wstring(capture_requested));
                 std::filesystem::create_directories(capture_folder);
                 spdlog::info("[PragmataAFWCaptureV4] folder={}", capture_folder.string());
             }
@@ -403,7 +416,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 #if defined(PRAGMATA)
     pragmata_resolve_capture::Context resolve_capture;
     const bool resolve_ready = capture_this_frame && pragmata_resolve_capture::prepare(resolve_capture, device, cmdList, m_eyeFrameBuffers);
-    if (capture_this_frame && !resolve_ready) spdlog::warn("[PragmataResolveV7] stage capture unavailable; ordinary capture retained");
+    if (capture_this_frame && !resolve_ready) spdlog::warn("[PragmataResolveV8] stage capture unavailable; ordinary capture retained");
 #endif
 #if defined(PRAGMATA)
     if (capture_this_frame) {
@@ -655,12 +668,16 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             save(m_eyeFrameBuffers.eyeFrameBuffers[1].color.pTexture,
                 D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, L"output_right");
             if (resolve_capture.captured) {
-                save(resolve_capture.before[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"before_resolve_left");
-                save(resolve_capture.before[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"before_resolve_right");
-                save(resolve_capture.after[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"after_resolve_left");
-                save(resolve_capture.after[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"after_resolve_right");
+                if (resolve_capture.capture_mask & 1u) {
+                    save(resolve_capture.before[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"before_resolve_left");
+                    save(resolve_capture.after[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"after_resolve_left");
+                }
+                if (resolve_capture.capture_mask & 2u) {
+                    save(resolve_capture.before[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"before_resolve_right");
+                    save(resolve_capture.after[1].Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"after_resolve_right");
+                }
             }
-            spdlog::info("[PragmataResolveV7] eye={} ready={} matches={} captured={} known={},{}",
+            spdlog::info("[PragmataResolveV8] eye={} ready={} matches={} captured={} known={},{}",
                 static_cast<int>(nEye), resolve_ready, resolve_capture.matches, resolve_capture.captured,
                 resolve_capture.known[0], resolve_capture.known[1]);
             save(capture_scene.Get(), D3D12_RESOURCE_STATE_COPY_DEST, L"input_scene");
