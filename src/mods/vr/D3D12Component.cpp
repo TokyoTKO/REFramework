@@ -2,6 +2,7 @@
 #include <chrono>
 #include <fstream>
 #include <MinHook.h>
+#include "sdk/RETypeDB.hpp"
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -312,6 +313,34 @@ struct History {
     DXGI_FORMAT format{};
 };
 static History history_mask;
+// Use the game's pause service rather than menu names or screen-space rectangles.
+// If the query is unavailable, retain the user-confirmed V10 gameplay behaviour.
+static bool menu_pause_active() {
+    if (!g_framework->is_ready()) return false;
+    static sdk::REMethodDefinition* method = nullptr;
+    static bool warned = false;
+    if (!method) {
+        auto* type = sdk::find_type_definition("app.PauseManager");
+        if (type) method = type->get_method("isPaused");
+    }
+    if (!method || method->get_num_params() != 0) {
+        if (!warned) {
+            spdlog::warn("[PragmataMenuV11] pause query unavailable or has parameters; preserving V10");
+            warned = true;
+        }
+        return false;
+    }
+    auto* manager = sdk::get_managed_singleton<::REManagedObject>("app.PauseManager");
+    if (!manager) return false;
+    const bool paused = method->call<bool>(sdk::get_thread_context(), manager);
+    static int last = -1;
+    if (last != static_cast<int>(paused)) {
+        spdlog::info("[PragmataMenuV11] paused={} historyProtection={}", paused, !paused);
+        last = static_cast<int>(paused);
+    }
+    return paused;
+}
+
 struct Scope {
     Context* previous;
     Context* context;
@@ -351,7 +380,7 @@ struct Scope {
                     c->current_ui = p.InUIColorAlpha->shaderResourceViewHandle.ptr;
                     c->previous_ui = h.mask.shaderResourceViewHandle.ptr;
                     c->fix_history = h.valid && h.frame + 1 == frame && h.eye != static_cast<int>(p.EyeIndex) &&
-                        c->current_ui && c->previous_ui;
+                        c->current_ui && c->previous_ui && !menu_pause_active();
                     c->sources[3].desc = h.mask;
                     static bool announced = false;
                     if (c->fix_history && !announced) {
@@ -577,7 +606,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 const auto length = GetModuleFileNameW(nullptr, exe_path, 32768);
                 if (!length || length >= 32768) throw std::runtime_error("Cannot resolve game directory");
                 capture_folder = std::filesystem::path(exe_path).parent_path() /
-                    L"reframework" / L"data" / (L"afw_history_v10_capture_" + std::to_wstring(capture_requested));
+                    L"reframework" / L"data" / (L"afw_menu_v11_capture_" + std::to_wstring(capture_requested));
                 std::filesystem::create_directories(capture_folder);
                 spdlog::info("[PragmataAFWCaptureV4] folder={}", capture_folder.string());
             }
