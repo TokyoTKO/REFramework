@@ -272,7 +272,18 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         params.InMotionScale[1] = (float)colorDesc.Height;
         params.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
         params.EyeIndex = nEye;
+#if defined(PRAGMATA)
+        // Controlled V6 diagnostic: force the existing plugin clear path.
+        // Do not alter the ModToggle or persist a configuration change.
+        params.ClearBeforeWarping = true;
+        static bool clear_test_logged = false;
+        if (!clear_test_logged) {
+            spdlog::info("[PragmataAFWClearV6] active: ClearBeforeWarping=true; all other AFW parameters unchanged");
+            clear_test_logged = true;
+        }
+#else
         params.ClearBeforeWarping = vr->m_clear_before_framewarp->value();
+#endif
         params.CameraData = &vr->cameraData[nEye];
         params.IgnoreMotionThreshold = vr->m_ignore_motion_threshold->value();
         params.Debug = vr->m_framewarp_debug->value();
